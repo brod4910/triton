@@ -15,15 +15,35 @@ def cdiv(x, div):
     """
     return (x + div - 1) // div
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_stages=3,
+                      num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=5,
+                      num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=5,
+                      num_warps=2),
+    ],
+    key=['out_h', 'out_w'],
+)
 @triton.jit#(interpret=True)
 def _resize_bilinear(in_ptr, in_h, in_w,
                      stride_in_h, stride_in_w,
                      out_ptr, out_h, out_w,
                      stride_out_h, stride_out_w,
                      scale_x, scale_y,
-                     BLOCK_M: tl.constexpr,
-                     BLOCK_N: tl.constexpr):
+                     BLOCK_SIZE_M: tl.constexpr,
+                     BLOCK_SIZE_N: tl.constexpr):
     # Grab the Micro-tile index. For the initiated, this is equivalent in CUDA:
     #  
     #
@@ -32,9 +52,9 @@ def _resize_bilinear(in_ptr, in_h, in_w,
     y_id = tl.program_id(1)
 
     # BM
-    out_x_offsets = (x_id * BLOCK_M + tl.arange(0, BLOCK_M)) % out_w
+    out_x_offsets = (x_id * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % out_w
     # BN
-    out_y_offsets = (y_id * BLOCK_N + tl.arange(0, BLOCK_N)) % out_h
+    out_y_offsets = (y_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % out_h
 
     # BM x BN
     out_ptrs = out_ptr + (out_x_offsets[:, None] * stride_out_w + out_y_offsets[None, :] * stride_out_h)
@@ -81,17 +101,14 @@ def resize_bilinear(X: torch.Tensor, Y: torch.Tensor):
 
     scale_x = (in_w - 1) / (out_w - 1)
     scale_y = (in_h - 1) / (out_h - 1)
-    BLOCK_SIZE = 128
-    # replace with tl cdiv
-    grid = (cdiv(out_h, BLOCK_SIZE), cdiv(out_w, BLOCK_SIZE))
+
+    grid = lambda META: (triton.cdiv(out_w, META["BLOCK_SIZE_M"]), triton.cdiv(out_h, META["BLOCK_SIZE_N"]))
 
     _resize_bilinear[grid](X, in_h, in_w,
                            X.stride(0), X.stride(1),
                            Y, out_h, out_w,
                            Y.stride(0), Y.stride(1),
-                           scale_x, scale_y,
-                           BLOCK_M=BLOCK_SIZE,
-                           BLOCK_N=BLOCK_SIZE)
+                           scale_x, scale_y)
 
 
 A = torch.arange(0, 224, 1, dtype=torch.float32).repeat(224, 1).cuda()
@@ -102,3 +119,34 @@ resize_bilinear(A, B)
 torch_ref = torch.nn.functional.interpolate(A.unsqueeze(0).unsqueeze(0), (512,512), mode="bilinear", align_corners=True).squeeze(0).squeeze(0)
 
 print(torch.allclose(torch_ref, B))
+
+t_interp = torch.nn.functional.interpolate
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['M', 'N'],  # Argument names to use as an x-axis for the plot
+        x_vals=[128 * i for i in range(2, 33)],  # Different possible values for `x_name`
+        line_arg='provider',  # Argument name whose value corresponds to a different line in the plot
+        # Possible values for `line_arg`
+        line_vals=['pytorch', 'triton'],
+        # Label name for the lines
+        line_names=["pytorch", "Triton"],
+        # Line styles
+        styles=[('green', '-'), ('blue', '-')],
+        ylabel="TFLOPS",  # Label name for the y-axis
+        plot_name="resize-performance",  # Name for the plot, used also as a file name for saving the plot.
+        args={},
+    ))
+def benchmark(M, N, provider):
+    a = torch.randn((224, 224), device='cuda', dtype=torch.float32)
+    b = torch.zeros((N, M), device='cuda', dtype=torch.float32)
+    quantiles = [0.5, 0.2, 0.8]
+    if provider == 'pytorch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: t_interp(a.unsqueeze(0).unsqueeze(0), (N, M), mode="bilinear", align_corners=True), quantiles=quantiles)
+    if provider == 'triton':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: resize_bilinear(a, b), quantiles=quantiles)
+    perf = lambda ms: 2 * M * N * 1e-12 / (ms * 1e-3)
+    return perf(ms), perf(max_ms), perf(min_ms)
+
+
+benchmark.run(print_data=True, save_path=".")
