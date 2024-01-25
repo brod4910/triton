@@ -1,19 +1,10 @@
+import os
+
 import torch
 
 import triton
 import triton.language as tl
 
-
-def cdiv(x, div):
-    """
-    Computes the ceiling division of :code:`x` by :code:`div`
-
-    :param x: the input number
-    :type input: Block
-    :param div: the divisor
-    :param div: Block
-    """
-    return (x + div - 1) // div
 
 @triton.autotune(
     configs=[
@@ -44,54 +35,106 @@ def _resize_bilinear(in_ptr, in_h, in_w,
                      scale_x, scale_y,
                      BLOCK_SIZE_M: tl.constexpr,
                      BLOCK_SIZE_N: tl.constexpr):
-    # Grab the Micro-tile index. For the initiated, this is equivalent in CUDA:
+    # Grab the Micro-tile index. For the uninitiated, this is equivalent to CUDA:
     #  
-    #
-    #
+    # >>> int x_id = blockIdx.x
+    # >>> int y_id = BlockIdx.y
     x_id = tl.program_id(0)
     y_id = tl.program_id(1)
 
-    # BM
+    # We grab a block of x,y offsets that we will then calculate the addresses
+    # that we want to store the output of interpolation. This is equivalent to CUDA:
+    #
+    # >>> int offsets_x[BLOCK_SIZE_M];
+    # >>> for (int i = 0; i < BLOCK_SIZE_M; ++i) {
+    #       offsets_x[i] = (blockIdx.x * blockDim.x + threadId.x) % out_w
+    #   }
+    #
+    # The modulo operator is important so we don't go out of bounds when accessing the output array.
+    # i.e,
+    #   >>> out_w = 512
+    #   >>> offsets = [0, 1, 2, 3, 4,..., 127]
+    #   >>> offsets = offsets % out_w
+    #
+    # The modulo operator keeps the offsets within the bounds of the output with variable
+    # since 512 % 512 = 0, 513 % 512 = 1, etc.
+    #
+    # A more full proof operation would be to mask the offsets to prevent out-of-bounds loads.
+    #
+    # (BM,)
     out_x_offsets = (x_id * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % out_w
-    # BN
+    # (BN,)
     out_y_offsets = (y_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % out_h
 
-    # BM x BN
+    # We vectorize the calculated x,y offsets and create an BM x BN matrix of
+    # memory addresses (pointers) these addresses are then used to store the
+    # result of interpolation.
+    #
+    # Results in a (BM, 1) matrix
+    # >>> stride_out_w = 1
+    # >>> out_x_offsets = out_x_offsets[:, None] * stride_out_w
+    #
+    # Results in a (1, BN) matrix
+    # >>> stride_out_h = 512
+    # >>> out_y_offsets = out_y_offsets[None, :] * stride_out_h
+    #
+    # The goal here is to the vectorized offsets of the output for later use
+    #
+    # (BM, BN)
     out_ptrs = out_ptr + (out_x_offsets[:, None] * stride_out_w + out_y_offsets[None, :] * stride_out_h)
 
-    in_x_offsets = out_x_offsets * scale_x # BM
-    in_y_offsets = out_y_offsets * scale_y # BN
+    # We multiply by the scale to get the input offsets from the output
+    in_x_offsets = out_x_offsets * scale_x # (BM,)
+    in_y_offsets = out_y_offsets * scale_y # (BN,)
 
+    # We calculate the x,y points used for bilinear interpolation
     x1 = tl.math.floor(in_x_offsets)
     y1 = tl.math.floor(in_y_offsets)
     x2 = tl.math.ceil(in_x_offsets)
     y2 = tl.math.ceil(in_y_offsets)
 
+    # Used for debugging purposes if @triton.jit(interpret=True)
+    # If you want to debug, then comment the above calculation for
+    # the x,y points
     # x1 = in_x_offsets // 1
     # y1 = in_y_offsets // 1
     # x2 = in_x_offsets // 1 + 1
     # y2 = in_y_offsets // 1 + 1
 
-    # x,y weights
+    # Calculate x,y weights and expand them to (BM, 1) and (1, BN) matrices
     dx = (in_x_offsets - x1)[:, None]
     dy = (in_y_offsets - y1)[None, :]
 
+    # Convert the dtypes of the x,y coordinates to int32 from float32.
+    # We use these points to index and load the addresses required for bilinear interpolation
+    # Expand the dimensions to (BM, 1), (1, BN), (BM, 1), and (1, BN) respectively.
+    #
+    # We also modulo the last x2 and y2 points so we don't device-side assert a segmentation fault.
+    # Again, the modulo operator keeps the offsets within the range of the dimensions of the image in this case.
     x1 = x1.to(tl.int32)[:, None]
     y1 = y1.to(tl.int32)[None, :]
     x2 = x2.to(tl.int32)[:, None] % in_w
     y2 = y2.to(tl.int32)[None, :] % in_h
 
+    # Again for debugging purposes if @triton.jit(interpret=True)
+    # If you want to debug, then comment the above casts.
     # x1 = x1.to(torch.int32)
     # y1 = y1.to(torch.int32)
     # x2 = x2.to(torch.int32) % in_w
     # y2 = y2.to(torch.int32) % in_h
 
+    # Vectorize the calculated x,y offsets and create an BM x BN matrix of
+    # memory addresses (pointers) these addresses are then used to load the
+    # values required for producing the interpolation result.
     a = tl.load(in_ptr + (x1 * stride_in_w + y1 * stride_in_h))
     b = tl.load(in_ptr + (x2 * stride_in_w + y1 * stride_in_h))
     c = tl.load(in_ptr + (x1 * stride_in_w + y2 * stride_in_h))
     d = tl.load(in_ptr + (x2 * stride_in_w + y2 * stride_in_h))
 
+    # Calculate the block of pixel values for the matrix of output addresses.
     P = a * (1 - dx) * (1 - dy) + b * dx * (1 - dy) + c * dy * (1 - dx) + d * dx * dy
+
+    # store the result in P.
     tl.store(out_ptrs, P)
 
 
@@ -118,7 +161,7 @@ resize_bilinear(A, B)
 
 torch_ref = torch.nn.functional.interpolate(A.unsqueeze(0).unsqueeze(0), (512,512), mode="bilinear", align_corners=True).squeeze(0).squeeze(0)
 
-print(torch.allclose(torch_ref, B))
+assert torch.allclose(torch_ref, B)
 
 t_interp = torch.nn.functional.interpolate
 
