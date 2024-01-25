@@ -107,4 +107,4 @@ def benchmark(M, N, provider):
     gbps = lambda ms: 2 * x.nelement() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
-benchmark.run(print_data=True, save_path=".")
+benchmark.run(print_data=True, save_path="")

@@ -75,4 +75,4 @@ def benchmark(size, provider):
     return gbps(ms), gbps(min_ms), gbps(max_ms)
 
 
-benchmark.run(print_data=True, save_path=".")
+benchmark.run(print_data=True, save_path="")

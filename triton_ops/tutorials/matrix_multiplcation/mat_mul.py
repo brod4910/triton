@@ -293,4 +293,4 @@ def benchmark(M, N, K, provider):
     return perf(ms), perf(max_ms), perf(min_ms)
 
 
-benchmark.run(print_data=True, save_path=".")
+benchmark.run(print_data=True, save_path="")
