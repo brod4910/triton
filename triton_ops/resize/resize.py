@@ -50,7 +50,7 @@ def _resize_bilinear(in_ptr, in_h, in_w,
     #       offsets_x[i] = (blockIdx.x * blockDim.x + threadId.x) % out_w
     #   }
     #
-    # The modulo operator is important so we don't go out of bounds when accessing the output array.
+    # The modulo operator is important, so we don't go out of bounds when accessing the output array.
     # i.e,
     #   >>> out_w = 512
     #   >>> offsets = [0, 1, 2, 3, 4,..., 127]
