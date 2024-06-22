@@ -17,49 +17,36 @@ import torch
 import triton
 import triton.language as tl
 
-
 # %%
 # Motivations
 # -----------
 #
 # Triton can also be used to optimize other stages of an ML pipeline.
-# In this tutorial, we will be implementing single channel bilinear interpolation 
-# 
+# In this tutorial, we will be implementing single channel bilinear interpolation
+#
 # Exercise:
 #   After this tutorial, try extending this to 3-channel interpolation for RGB images.
-# 
+#
+
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=5,
-                      num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=5,
-                      num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=5, num_warps=2),
     ],
     key=['out_h', 'out_w'],
 )
 @triton.jit
-def _resize_bilinear(in_ptr, in_h, in_w,
-                     stride_in_h, stride_in_w,
-                     out_ptr, out_h, out_w,
-                     stride_out_h, stride_out_w,
-                     scale_x, scale_y,
-                     BLOCK_SIZE_M: tl.constexpr,
-                     BLOCK_SIZE_N: tl.constexpr):
+def _resize_bilinear(in_ptr, in_h, in_w, stride_in_h, stride_in_w, out_ptr, out_h, out_w, stride_out_h, stride_out_w,
+                     scale_x, scale_y, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
     # Grab the Micro-tile index. This is equivalent to CUDA:
-    #  
+    #
     # >>> int x_id = blockIdx.x
     # >>> int y_id = BlockIdx.y
     x_id = tl.program_id(0)
@@ -107,8 +94,8 @@ def _resize_bilinear(in_ptr, in_h, in_w,
     out_ptrs = out_ptr + (out_x_offsets[:, None] * stride_out_w + out_y_offsets[None, :] * stride_out_h)
 
     # We multiply by the scale to get the input offsets from the output
-    in_x_offsets = out_x_offsets * scale_x # (BM,)
-    in_y_offsets = out_y_offsets * scale_y # (BN,)
+    in_x_offsets = out_x_offsets * scale_x  # (BM,)
+    in_y_offsets = out_y_offsets * scale_y  # (BN,)
 
     # We calculate the x,y points used for bilinear interpolation
     x1 = tl.math.floor(in_x_offsets)
@@ -155,11 +142,8 @@ def resize_bilinear(X: torch.Tensor, Y: torch.Tensor):
 
     grid = lambda META: (triton.cdiv(out_w, META["BLOCK_SIZE_M"]), triton.cdiv(out_h, META["BLOCK_SIZE_N"]))
 
-    _resize_bilinear[grid](X, in_h, in_w,
-                           X.stride(0), X.stride(1),
-                           Y, out_h, out_w,
-                           Y.stride(0), Y.stride(1),
-                           scale_x, scale_y)
+    _resize_bilinear[grid](X, in_h, in_w, X.stride(0), X.stride(1), Y, out_h, out_w, Y.stride(0), Y.stride(1), scale_x,
+                           scale_y)
 
 
 A = torch.arange(0, 224, 1, dtype=torch.float32).repeat(224, 1).cuda()
@@ -168,11 +152,13 @@ B = torch.zeros(512, 512, dtype=torch.float32).cuda()
 resize_bilinear(A, B)
 
 # Torch interpolate requires that the tensor is 4-D for bilinear interpolation
-torch_ref = torch.nn.functional.interpolate(A.unsqueeze(0).unsqueeze(0), (512,512), mode="bilinear", align_corners=True).squeeze(0).squeeze(0)
+torch_ref = torch.nn.functional.interpolate(
+    A.unsqueeze(0).unsqueeze(0), (512, 512), mode="bilinear", align_corners=True).squeeze(0).squeeze(0)
 
 assert torch.allclose(torch_ref, B)
 
 torch_interp = partial(torch.nn.functional.interpolate, mode="bilinear", align_corners=True)
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -194,7 +180,8 @@ def benchmark(M, N, provider):
     b = torch.zeros((N, M), device='cuda', dtype=torch.float32)
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'pytorch':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch_interp(a.unsqueeze(0).unsqueeze(0), (N, M)), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch_interp(a.unsqueeze(0).unsqueeze(0), (N, M)),
+                                                     quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: resize_bilinear(a, b), quantiles=quantiles)
     gbps = lambda ms: 2 * a.numel() * a.element_size() * 1e-9 / (ms * 1e-3)
