@@ -75,6 +75,7 @@ class BlockPointerHandle:
 class InterpreterOptions:
     extern_libs: dict = None
     debug: bool = False
+    sanitize_overflow: bool = True
     arch: str = None
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e5b16", "fp8e4nv", "fp8e4b8", "fp8e4b15")
     deprecated_fp8_dtypes: Tuple[str] = ()
@@ -643,9 +644,9 @@ class InterpreterBuilder:
         if hex:
             np.set_printoptions(formatter=None)
 
-    def create_assert(self, condition, message, fileName, funcName, lineNo):
+    def create_assert(self, condition, message):
         # Interpreter's device_assert function has a different format than Triton's device_assert
-        assert condition, f"{message} in {fileName}:{funcName}:{lineNo}"
+        assert condition, f"{message}"
 
     def create_assume(self, condition):
         assert condition, "Assume failed"
