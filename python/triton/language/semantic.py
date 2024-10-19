@@ -6,7 +6,6 @@ import numbers
 
 from .._C.libtriton import ir
 from . import core as tl
-from . import math
 
 T = TypeVar('T')
 
