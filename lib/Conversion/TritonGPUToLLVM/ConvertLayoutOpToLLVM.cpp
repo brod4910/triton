@@ -314,7 +314,9 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
       //         complicated enough we may fall back to using shared memory
       // TODO(Keren): implement warp shuffle instead of using the general
       // approach that uses shared memory
-      return transferWithinBlock(op, srcLayout, dstLayout, adaptor, rewriter);
+      return transferWithinWarp(op, dstLayout.getFreeVariableMasks()[kLane],
+                                dstLayout.getInDimSize(kLane), srcLayout,
+                                dstLayout, adaptor, rewriter);
     } else if (llvm::is_contained(dims, kRegister) ||
                dstLayout.getInDimSize(kRegister) !=
                    srcLayout.getInDimSize(kRegister)) {
@@ -361,6 +363,37 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
     return success();
   }
 
+  LogicalResult transferWithinWarp(ConvertLayoutOp op, int32_t laneMasks,
+                                   int32_t numLanes,
+                                   const LinearLayout &srcLayout,
+                                   const LinearLayout &dstLayout,
+                                   OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter) const {
+    MLIRContext *ctx = op.getContext();
+    auto loc = op.getLoc();
+    auto srcTy = op.getSrc().getType();
+    auto dstTy = op.getType();
+
+    assert(cvtNeedsWarpShuffle(srcTy, dstTy));
+
+    StringAttr kRegister = str_attr("register");
+    StringAttr kLane = str_attr("lane");
+    StringAttr kWarp = str_attr("warp");
+
+    Value threadId = getThreadId(rewriter, loc);
+    Value threadsPerWarp = i32_val(srcLayout.getInDimSize(kLane));
+    Value laneId = urem(threadId, threadsPerWarp);
+    Value warpId = udiv(threadId, threadsPerWarp);
+
+    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    SmallVector<Value> outVals(numLanes);
+
+    for (int i = 0; i < numLanes; ++i) {
+    }
+
+    return success();
+  }
+
   LogicalResult transferWithinBlock(ConvertLayoutOp op,
                                     const LinearLayout &srcLayout,
                                     const LinearLayout &dstLayout,
@@ -371,9 +404,10 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getType();
 
-    // TODO (Keren): Currently, we handle general mma/blocked/slice/dot(ampere)
-    // -> mma/blocked/slice/dot(ampere) conversions. The following tasks must be
-    // completed before we can remove the layoutIsOK check:
+    // TODO (Keren): Currently, we handle general
+    // mma/blocked/slice/dot(ampere)
+    // -> mma/blocked/slice/dot(ampere) conversions. The following tasks must
+    // be completed before we can remove the layoutIsOK check:
     // 1. Support for AMD's MFMA and WMMA
     std::function<bool(Attribute)> layoutIsOK = [&](Attribute layout) {
       if (auto nvidiaMma = dyn_cast<NvidiaMmaEncodingAttr>(layout)) {
@@ -484,17 +518,17 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
     auto tensorShapePerCTA = convertType<unsigned, int64_t>(getShapePerCTA(
         op.getSrc().getType().getEncoding(), op.getType().getShape()));
     // Input dims: [offset, iteration, block]
-    // Output dims: dimN-1, dimN-2, ..., dim0, where N is obtained from repShape
+    // Output dims: dimN-1, dimN-2, ..., dim0, where N is obtained from
+    // repShape
     LinearLayout sharedLayout = chooseShemLayoutForRegToRegConversion(
         ctx, tensorShapePerCTA, scratchConfig.repShape, scratchConfig.order);
 
     // Layout for the store from registers to shared memory.
     //
-    // Note: If two threads in the same warp write to the same shmem offset, the
-    // hardware resolves that without a stall or a bank conflict.  Therefore we
-    // don't need to avoid duplicate writes.
-    // Input dims: [reg, lane, warp]
-    // Output dims: [offset, iteration]
+    // Note: If two threads in the same warp write to the same shmem offset,
+    // the hardware resolves that without a stall or a bank conflict.
+    // Therefore we don't need to avoid duplicate writes. Input dims: [reg,
+    // lane, warp] Output dims: [offset, iteration]
     std::optional<LinearLayout> shmemStoreLayout =
         chooseStMatrixLayout(ctx, op.getSrc().getType(), scratchConfig.repShape,
                              scratchConfig.paddedRepShape, scratchConfig.order,
@@ -536,8 +570,8 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
     assert(scratchConfig.outVec * iterations <= outSize);
 
     // Check only one dimension has been padded.
-    // This means the difference between the padded shape and the original shape
-    // should only be in one dimension, specifically in
+    // This means the difference between the padded shape and the original
+    // shape should only be in one dimension, specifically in
     // `scratchConfig.order[0]`.
     auto rank = scratchConfig.repShape.size();
     for (auto i = 0; i < rank; i++) {
@@ -555,8 +589,8 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
     // L(r, t, w, b) = L(0, t, w, b) xor L(r, 0, 0, 0)
     //   offset      =    regBase   xor    regIdx
     //
-    // It is the same hack as what we've done in the emitIndices function to get
-    // around performance issues on AMD GPUs
+    // It is the same hack as what we've done in the emitIndices function to
+    // get around performance issues on AMD GPUs
     auto getVecAddr = [&](LinearLayout &layout, Value &regBase,
                           int regSlice) -> Value {
       auto regIdx = layout
@@ -639,8 +673,8 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
     return outValsVec;
   }
 
-  // Determine which registers are read/written in which iteration of the shmem
-  // transfer specified by `layout`.
+  // Determine which registers are read/written in which iteration of the
+  // shmem transfer specified by `layout`.
   SmallVector<SmallVector<int> /*registers*/>
   collectRegsForIter(MLIRContext *ctx, const LinearLayout &layout) const {
     StringAttr kRegister = str_attr("register");
@@ -649,8 +683,9 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
     StringAttr kBlock = str_attr("block");
     StringAttr kIteration = str_attr("iteration");
 
-    // The choice of iteration should be determined only by the register.  That
-    // is, it should be correct to split the register dimension into iterations.
+    // The choice of iteration should be determined only by the register. That
+    // is, it should be correct to split the register dimension into
+    // iterations.
     assert(layout.sublayoutIsZero({kLane, kWarp, kBlock}, {kIteration}));
 
     LinearLayout sublayout = layout.sublayout({kRegister}, {kIteration});
